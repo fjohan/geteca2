@@ -597,6 +597,7 @@ def make_clips(
     pre_roll: float,
     post_roll: float,
     clip_format: str,
+    overlay_stickman: bool,
 ) -> None:
     require_executable("ffmpeg")
     clips_dir = out_dir / "clips"
@@ -608,6 +609,10 @@ def make_clips(
         if duration:
             end = min(duration, end)
         clip_path = clips_dir / f"rank_{candidate.rank:03d}_{start:.2f}_{end:.2f}.{clip_format}"
+        if overlay_stickman:
+            render_stickman_clip(video_path, clip_path, start, end)
+            candidate.clip_path = str(clip_path.relative_to(out_dir))
+            continue
         stream_copy = [
             "ffmpeg",
             "-y",
@@ -640,6 +645,110 @@ def make_clips(
             ]
             run(reencode)
         candidate.clip_path = str(clip_path.relative_to(out_dir))
+
+
+def render_stickman_clip(video_path: Path, clip_path: Path, start: float, end: float) -> None:
+    temp_video = clip_path.with_name(clip_path.stem + ".overlay_tmp.mp4")
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise SystemExit(f"Could not open video for overlay rendering: {video_path}")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(temp_video), fourcc, fps, (width, height))
+    if not writer.isOpened():
+        cap.release()
+        raise SystemExit(f"Could not create overlay clip: {temp_video}")
+
+    cap.set(cv2.CAP_PROP_POS_MSEC, start * 1000.0)
+    with mp.solutions.holistic.Holistic(
+        static_image_mode=False,
+        model_complexity=1,
+        enable_segmentation=False,
+        refine_face_landmarks=False,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
+    ) as holistic:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            timestamp = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+            if timestamp > end:
+                break
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            rgb.flags.writeable = False
+            result = holistic.process(rgb)
+            draw_stickman_overlay(frame, result)
+            writer.write(frame)
+    writer.release()
+    cap.release()
+
+    mux = [
+        "ffmpeg",
+        "-y",
+        "-ss",
+        f"{start:.3f}",
+        "-to",
+        f"{end:.3f}",
+        "-i",
+        str(video_path),
+        "-i",
+        str(temp_video),
+        "-map",
+        "1:v:0",
+        "-map",
+        "0:a?",
+        "-c:v",
+        "libx264",
+        "-c:a",
+        "aac",
+        "-shortest",
+        str(clip_path),
+    ]
+    run(mux)
+    try:
+        temp_video.unlink()
+    except OSError:
+        pass
+
+
+def draw_stickman_overlay(frame, result) -> None:
+    height, width = frame.shape[:2]
+    pose_landmarks = result.pose_landmarks
+    drawing = mp.solutions.drawing_utils
+    hands = mp.solutions.hands
+    style = drawing.DrawingSpec(color=(0, 255, 255), thickness=2, circle_radius=2)
+    hand_style = drawing.DrawingSpec(color=(0, 180, 255), thickness=1, circle_radius=1)
+
+    if pose_landmarks:
+        pose = mp.solutions.pose.PoseLandmark
+        arm_connections = [
+            (pose.LEFT_SHOULDER.value, pose.LEFT_ELBOW.value),
+            (pose.LEFT_ELBOW.value, pose.LEFT_WRIST.value),
+            (pose.RIGHT_SHOULDER.value, pose.RIGHT_ELBOW.value),
+            (pose.RIGHT_ELBOW.value, pose.RIGHT_WRIST.value),
+            (pose.LEFT_SHOULDER.value, pose.RIGHT_SHOULDER.value),
+        ]
+        for start_idx, end_idx in arm_connections:
+            draw_pose_connection(frame, pose_landmarks, start_idx, end_idx, width, height)
+    if result.left_hand_landmarks:
+        drawing.draw_landmarks(frame, result.left_hand_landmarks, hands.HAND_CONNECTIONS, hand_style, hand_style)
+    if result.right_hand_landmarks:
+        drawing.draw_landmarks(frame, result.right_hand_landmarks, hands.HAND_CONNECTIONS, hand_style, hand_style)
+
+
+def draw_pose_connection(frame, landmarks, start_idx: int, end_idx: int, width: int, height: int) -> None:
+    a = landmarks.landmark[start_idx]
+    b = landmarks.landmark[end_idx]
+    if getattr(a, "visibility", 1.0) < 0.35 or getattr(b, "visibility", 1.0) < 0.35:
+        return
+    ax, ay = int(a.x * width), int(a.y * height)
+    bx, by = int(b.x * width), int(b.y * height)
+    cv2.line(frame, (ax, ay), (bx, by), (0, 255, 255), 3)
+    cv2.circle(frame, (ax, ay), 5, (0, 180, 255), -1)
+    cv2.circle(frame, (bx, by), 5, (0, 180, 255), -1)
 
 
 def write_html_report(out_dir: Path, candidates: list[Candidate]) -> None:
@@ -723,6 +832,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gesture-threshold", default="auto")
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--make-clips", type=parse_bool, default=False)
+    parser.add_argument(
+        "--overlay-stickman",
+        type=parse_bool,
+        default=False,
+        help="Draw MediaPipe arm/hand stickman overlays on generated review clips.",
+    )
     parser.add_argument("--clip-format", default="mp4")
     parser.add_argument("--keep-video", type=parse_bool, default=False)
     parser.add_argument("--sample-fps", type=float, default=10.0)
@@ -770,7 +885,15 @@ def main(argv: Iterable[str] | None = None) -> int:
         args.top_k,
     )
     if args.make_clips and candidates:
-        make_clips(video_path, args.out, candidates, args.pre_roll, args.post_roll, args.clip_format)
+        make_clips(
+            video_path,
+            args.out,
+            candidates,
+            args.pre_roll,
+            args.post_roll,
+            args.clip_format,
+            args.overlay_stickman,
+        )
     write_candidates(args.out, candidates)
     write_html_report(args.out, candidates)
     copy_or_keep_video(video_path, args.out, args.keep_video)

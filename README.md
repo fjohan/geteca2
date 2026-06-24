@@ -25,6 +25,7 @@ bin/python gesture_text_candidates.py \
   --url "https://www.youtube.com/watch?v=..." \
   --out ./corpus_run \
   --make-clips true \
+  --overlay-stickman true \
   --top-k 30
 ```
 
@@ -53,6 +54,8 @@ The output directory contains:
 - `clips/` when `--make-clips true`
 
 Candidate columns include rank, timestamp range, text, gesture score statistics, hand visibility percentages, and clip path when generated.
+
+When `--make-clips true --overlay-stickman true` is used, review clips are re-rendered with a MediaPipe arm/hand stickman overlay. The overlay draws shoulder-elbow-wrist lines plus detected hand landmarks. This affects only the review clips, not scoring or candidate detection.
 
 ## Scoring
 
@@ -121,6 +124,7 @@ This preserves the original VTT/SRT cue segmentation.
 --gesture-threshold auto
 --top-k 50
 --make-clips false
+--overlay-stickman false
 --clip-format mp4
 --keep-video false
 --sample-fps 10
