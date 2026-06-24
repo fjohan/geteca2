@@ -751,14 +751,58 @@ def draw_pose_connection(frame, landmarks, start_idx: int, end_idx: int, width: 
     cv2.circle(frame, (bx, by), 5, (0, 180, 255), -1)
 
 
-def write_html_report(out_dir: Path, candidates: list[Candidate]) -> None:
+def build_timeline_chart(candidates: list[Candidate], video_duration: float) -> str:
+    if not candidates or video_duration <= 0:
+        return ""
+    bars = []
+    max_score = max((candidate.candidate_score for candidate in candidates), default=1.0) or 1.0
+    for candidate in candidates:
+        left = max(0.0, min(100.0, candidate.start / video_duration * 100.0))
+        width = max(0.35, min(3.0, candidate.duration / video_duration * 100.0))
+        height = max(4.0, candidate.candidate_score / max_score * 100.0)
+        href = candidate.clip_path or f"#candidate-{candidate.rank}"
+        label = (
+            f"Rank {candidate.rank}: {candidate.start:.2f}-{candidate.end:.2f}s, "
+            f"score {candidate.candidate_score:.3f}"
+        )
+        bars.append(
+            f'<a class="timeline-bar" href="{html.escape(href)}" title="{html.escape(label)}" '
+            f'style="left: {left:.4f}%; width: {width:.4f}%; height: {height:.2f}%;">'
+            f'<span>{candidate.rank}</span></a>'
+        )
+    return f"""
+  <section class="timeline-section">
+    <h2>Timeline</h2>
+    <div class="timeline-chart" aria-label="Candidate scores over video time">
+      {''.join(bars)}
+    </div>
+    <div class="timeline-axis">
+      <span>0:00</span>
+      <span>{format_mmss(video_duration)}</span>
+    </div>
+  </section>
+"""
+
+
+def format_mmss(seconds: float) -> str:
+    total = max(0, int(round(seconds)))
+    minutes, secs = divmod(total, 60)
+    return f"{minutes}:{secs:02d}"
+
+
+def write_html_report(
+    out_dir: Path,
+    candidates: list[Candidate],
+    video_duration: float = 0.0,
+    timeline_chart: bool = False,
+) -> None:
     rows = []
     for candidate in candidates:
         media = ""
         if candidate.clip_path:
             media = f'<video src="{html.escape(candidate.clip_path)}" controls width="360"></video>'
         rows.append(
-            "<tr>"
+            f'<tr id="candidate-{candidate.rank}">'
             f"<td>{candidate.rank}</td>"
             f"<td>{candidate.start:.2f}-{candidate.end:.2f}</td>"
             f"<td>{candidate.candidate_score:.3f}</td>"
@@ -773,6 +817,37 @@ def write_html_report(out_dir: Path, candidates: list[Candidate]) -> None:
   <title>Gesture/Text Candidates</title>
   <style>
     body {{ font-family: system-ui, sans-serif; margin: 24px; }}
+    h1, h2 {{ margin: 0 0 16px; }}
+    .timeline-section {{ margin: 24px 0; }}
+    .timeline-chart {{
+      position: relative;
+      height: 180px;
+      border-left: 1px solid #bbb;
+      border-bottom: 1px solid #bbb;
+      background: linear-gradient(to top, #f5f5f5 1px, transparent 1px) 0 0 / 100% 25%;
+    }}
+    .timeline-bar {{
+      position: absolute;
+      bottom: 0;
+      min-width: 5px;
+      display: block;
+      background: #1d75b9;
+      border-radius: 3px 3px 0 0;
+      opacity: 0.85;
+      text-decoration: none;
+    }}
+    .timeline-bar:hover, .timeline-bar:focus {{ opacity: 1; background: #d35400; }}
+    .timeline-bar span {{
+      position: absolute;
+      left: 50%;
+      bottom: calc(100% + 4px);
+      transform: translateX(-50%);
+      color: #333;
+      font-size: 11px;
+      line-height: 1;
+      white-space: nowrap;
+    }}
+    .timeline-axis {{ display: flex; justify-content: space-between; color: #666; font-size: 12px; margin-top: 6px; }}
     table {{ border-collapse: collapse; width: 100%; }}
     th, td {{ border-bottom: 1px solid #ddd; padding: 8px; vertical-align: top; }}
     th {{ text-align: left; }}
@@ -780,6 +855,7 @@ def write_html_report(out_dir: Path, candidates: list[Candidate]) -> None:
 </head>
 <body>
   <h1>Gesture/Text Candidates</h1>
+  {build_timeline_chart(candidates, video_duration) if timeline_chart else ""}
   <table>
     <thead><tr><th>Rank</th><th>Time</th><th>Score</th><th>Text</th><th>Clip</th></tr></thead>
     <tbody>
@@ -838,6 +914,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Draw MediaPipe arm/hand stickman overlays on generated review clips.",
     )
+    parser.add_argument(
+        "--timeline-chart",
+        type=parse_bool,
+        default=False,
+        help="Add a clickable score-over-time bar chart to index.html.",
+    )
     parser.add_argument("--clip-format", default="mp4")
     parser.add_argument("--keep-video", type=parse_bool, default=False)
     parser.add_argument("--sample-fps", type=float, default=10.0)
@@ -895,7 +977,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             args.overlay_stickman,
         )
     write_candidates(args.out, candidates)
-    write_html_report(args.out, candidates)
+    report_duration = ffprobe_duration(video_path) if args.timeline_chart else 0.0
+    write_html_report(args.out, candidates, report_duration, args.timeline_chart)
     copy_or_keep_video(video_path, args.out, args.keep_video)
     log(f"Wrote {len(candidates)} candidates to {args.out / 'candidates.csv'}")
     return 0
