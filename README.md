@@ -54,6 +54,57 @@ The output directory contains:
 
 Candidate columns include rank, timestamp range, text, gesture score statistics, hand visibility percentages, and clip path when generated.
 
+## Scoring
+
+The tool first samples video frames, detects pose/hand landmarks with MediaPipe, and writes per-frame features to `frame_features.csv`.
+
+Frame-level `gesture_score` is based on:
+
+- normalized wrist speed
+- normalized wrist acceleration
+- visible hands or visible pose
+- whether hands are above shoulders
+- whether hands are extended far from the torso
+
+Scores are smoothed over roughly `0.7s` so a single noisy frame has less influence.
+
+For each subtitle window, the tool computes overlapping gesture statistics:
+
+- `mean_gesture_score`
+- `max_gesture_score`
+- `percent_frames_gesturing`
+- `left_hand_visible_percent`
+- `right_hand_visible_percent`
+
+Candidate score is currently:
+
+```python
+candidate_score = (
+    max_gesture_score * 0.35
+    + mean_gesture_score * 0.25
+    + percent_frames_gesturing * 0.20
+    + visible_percent * 0.10
+    + text_density * 0.05
+    + duration_factor * 0.05
+)
+```
+
+`visible_percent` is the strongest of left-hand visibility, right-hand visibility, or partial pose visibility for the segment.
+
+`text_density` is a capped speech-rate proxy based on words per second.
+
+`duration_factor` mildly favors longer windows up to `--max-duration`.
+
+`--gesture-threshold` controls which frames count as gesturing for `percent_frames_gesturing`. It does not directly set a minimum `candidate_score`, and it does not override duration filters. `--gesture-threshold auto` uses the 80th percentile of nonzero smoothed gesture scores. A numeric value such as `0.01` makes the gesturing-frame test more permissive.
+
+By default, adjacent subtitle cues are merged when the gap is `<= --merge-gap`, default `0.75s`. For Whisper VTT/SRT files that already have good review-sized segments, use:
+
+```bash
+--merge-gap -1
+```
+
+This preserves the original VTT/SRT cue segmentation.
+
 ## Options
 
 ```text
