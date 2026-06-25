@@ -13,7 +13,7 @@ import re
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
@@ -49,7 +49,46 @@ class Candidate:
     percent_frames_gesturing: float
     left_hand_visible_percent: float
     right_hand_visible_percent: float
+    face_visibility: float = 0.0
+    hand_visibility: float = 0.0
+    finger_visibility: float = 0.0
+    arm_motion: float = 0.0
+    hand_motion: float = 0.0
+    speech_duration: float = 0.0
+    mean_hand_size: float = 0.0
+    primary_reason: str = ""
+    reason_labels: list[str] = field(default_factory=list)
+    reason_confidences: dict[str, float] = field(default_factory=dict)
+    reason_evidence: dict[str, dict[str, float | str]] = field(default_factory=dict)
+    evidence_summary: str = ""
     clip_path: str = ""
+
+
+@dataclass
+class RankingWeights:
+    gesture: float = 0.30
+    face: float = 0.25
+    hand: float = 0.20
+    arm: float = 0.15
+    finger: float = 0.10
+
+
+@dataclass
+class CandidateFilters:
+    min_face_visible: float = 0.80
+    min_hand_visible: float = 0.0
+    min_hand_size: float = 0.0
+    min_finger_score: float = 0.0
+
+
+@dataclass
+class ReasonConfig:
+    threshold: float = 0.60
+    enable_text_reasons: bool = True
+    enable_finger_reasons: bool = True
+    labels: set[str] | None = None
+    top_reasons: int = 5
+    language: str = "en"
 
 
 def log(message: str) -> None:
@@ -80,6 +119,13 @@ def parse_bool(value: str | bool) -> bool:
     if normalized in {"0", "false", "no", "n", "off"}:
         return False
     raise argparse.ArgumentTypeError(f"Expected true/false, got {value!r}")
+
+
+def parse_reason_labels(value: str) -> set[str] | None:
+    normalized = value.strip()
+    if not normalized or normalized.lower() == "all":
+        return None
+    return {item.strip().upper() for item in normalized.split(",") if item.strip()}
 
 
 def parse_timecode(value: str) -> float:
@@ -295,7 +341,10 @@ def elbow_angle(
 def analyze_gestures(video_path: Path, out_dir: Path, sample_fps: float, force: bool) -> list[dict[str, float]]:
     features_path = out_dir / "frame_features.csv"
     if features_path.exists() and not force:
-        return read_frame_features(features_path)
+        cached_rows = read_frame_features(features_path)
+        if frame_rows_have_scoring_columns(cached_rows):
+            return cached_rows
+        log("Cached frame_features.csv lacks new scoring columns; regenerating.")
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -306,6 +355,8 @@ def analyze_gestures(video_path: Path, out_dir: Path, sample_fps: float, force: 
     rows: list[dict[str, float]] = []
     previous_wrists: dict[str, tuple[float, float, float] | None] = {"left": None, "right": None}
     previous_speeds: dict[str, float] = {"left": 0.0, "right": 0.0}
+    previous_elbow_angles: dict[str, float] = {"left": 0.0, "right": 0.0}
+    previous_hand_metrics: dict[str, dict[str, float] | None] = {"left": None, "right": None}
     frame_idx = 0
 
     with mp.solutions.holistic.Holistic(
@@ -345,6 +396,11 @@ def analyze_gestures(video_path: Path, out_dir: Path, sample_fps: float, force: 
             torso_size = max(distance(left_shoulder, right_shoulder), 0.08)
             row = frame_feature_row(
                 timestamp,
+                frame.shape[1],
+                frame.shape[0],
+                result.face_landmarks,
+                result.left_hand_landmarks,
+                result.right_hand_landmarks,
                 pose_landmarks,
                 left_hand_visible,
                 right_hand_visible,
@@ -357,6 +413,8 @@ def analyze_gestures(video_path: Path, out_dir: Path, sample_fps: float, force: 
                 torso_size,
                 previous_wrists,
                 previous_speeds,
+                previous_elbow_angles,
+                previous_hand_metrics,
                 1.0 / max(sample_fps, 0.1),
             )
             rows.append(row)
@@ -364,6 +422,20 @@ def analyze_gestures(video_path: Path, out_dir: Path, sample_fps: float, force: 
             previous_wrists["right"] = right_wrist
             previous_speeds["left"] = row["left_wrist_speed"]
             previous_speeds["right"] = row["right_wrist_speed"]
+            previous_elbow_angles["left"] = row["elbow_angle_left"]
+            previous_elbow_angles["right"] = row["elbow_angle_right"]
+            previous_hand_metrics["left"] = {
+                "orientation": row["left_hand_orientation"],
+                "openness": row["left_hand_openness"],
+                "spread": row["left_finger_spread"],
+                "pinch": row["left_pinch_distance"],
+            }
+            previous_hand_metrics["right"] = {
+                "orientation": row["right_hand_orientation"],
+                "openness": row["right_hand_openness"],
+                "spread": row["right_finger_spread"],
+                "pinch": row["right_pinch_distance"],
+            }
             frame_idx += 1
     cap.release()
     smooth_scores(rows, max(1, int(round(sample_fps * 0.7))))
@@ -373,6 +445,11 @@ def analyze_gestures(video_path: Path, out_dir: Path, sample_fps: float, force: 
 
 def frame_feature_row(
     timestamp: float,
+    frame_width: int,
+    frame_height: int,
+    face_landmarks,
+    left_hand_landmarks,
+    right_hand_landmarks,
     pose_landmarks,
     left_hand_visible: float,
     right_hand_visible: float,
@@ -385,6 +462,8 @@ def frame_feature_row(
     torso_size: float,
     previous_wrists: dict[str, tuple[float, float, float] | None],
     previous_speeds: dict[str, float],
+    previous_elbow_angles: dict[str, float],
+    previous_hand_metrics: dict[str, dict[str, float] | None],
     dt: float,
 ) -> dict[str, float]:
     pose_visible = 1.0 if pose_landmarks else 0.0
@@ -396,13 +475,45 @@ def frame_feature_row(
     right_above = 1.0 if right_wrist and right_shoulder and right_wrist[1] < right_shoulder[1] else 0.0
     left_far = 1.0 if distance(left_wrist, left_shoulder) / torso_size > 1.1 else 0.0
     right_far = 1.0 if distance(right_wrist, right_shoulder) / torso_size > 1.1 else 0.0
+    left_elbow_angle = elbow_angle(left_shoulder, left_elbow, left_wrist)
+    right_elbow_angle = elbow_angle(right_shoulder, right_elbow, right_wrist)
+    left_elbow_angular_velocity = abs(left_elbow_angle - previous_elbow_angles["left"]) / max(dt, 0.001)
+    right_elbow_angular_velocity = abs(right_elbow_angle - previous_elbow_angles["right"]) / max(dt, 0.001)
     motion_energy = min(1.0, (left_speed + right_speed) / 8.0) + min(1.0, (left_accel + right_accel) / 60.0) * 0.4
     visibility = max(left_hand_visible, right_hand_visible, pose_visible * 0.5)
     posture = max(left_above, right_above) * 0.2 + max(left_far, right_far) * 0.2
     raw_score = min(1.0, motion_energy * 0.65 + visibility * 0.25 + posture)
+    face_scores = compute_face_scores(face_landmarks, frame_width, frame_height)
+    left_hand_scores = compute_hand_scores(left_hand_landmarks, frame_width, frame_height)
+    right_hand_scores = compute_hand_scores(right_hand_landmarks, frame_width, frame_height)
+    left_hand_motion = compute_hand_motion_score(left_hand_scores, previous_hand_metrics["left"], dt)
+    right_hand_motion = compute_hand_motion_score(right_hand_scores, previous_hand_metrics["right"], dt)
+    arm_motion_score = compute_arm_motion_score(
+        left_speed,
+        right_speed,
+        left_accel,
+        right_accel,
+        left_elbow_angular_velocity,
+        right_elbow_angular_velocity,
+    )
+    hand_visibility_score = max(left_hand_scores["visibility"], right_hand_scores["visibility"])
+    finger_visibility_score = max(left_hand_scores["finger_visibility"], right_hand_scores["finger_visibility"])
+    hand_motion_score = max(left_hand_motion, right_hand_motion)
+    hand_size = max(left_hand_scores["size"], right_hand_scores["size"])
     return {
         "timestamp": timestamp,
         "pose_visible": pose_visible,
+        "face_visibility_score": face_scores["visibility"],
+        "face_landmark_percent": face_scores["landmark_percent"],
+        "face_size": face_scores["size"],
+        "face_yaw_score": face_scores["yaw_score"],
+        "hand_visibility_score": hand_visibility_score,
+        "finger_visibility_score": finger_visibility_score,
+        "arm_motion_score": arm_motion_score,
+        "hand_motion_score": hand_motion_score,
+        "mean_hand_size": hand_size,
+        "left_hand_size": left_hand_scores["size"],
+        "right_hand_size": right_hand_scores["size"],
         "left_hand_visible": left_hand_visible,
         "right_hand_visible": right_hand_visible,
         "left_wrist_x": left_wrist[0] if left_wrist else 0.0,
@@ -425,27 +536,254 @@ def frame_feature_row(
         "hand_above_shoulder_right": right_above,
         "hand_far_from_torso_left": left_far,
         "hand_far_from_torso_right": right_far,
-        "elbow_angle_left": elbow_angle(left_shoulder, left_elbow, left_wrist),
-        "elbow_angle_right": elbow_angle(right_shoulder, right_elbow, right_wrist),
+        "elbow_angle_left": left_elbow_angle,
+        "elbow_angle_right": right_elbow_angle,
+        "elbow_angular_velocity_left": left_elbow_angular_velocity,
+        "elbow_angular_velocity_right": right_elbow_angular_velocity,
+        "left_hand_orientation": left_hand_scores["orientation"],
+        "right_hand_orientation": right_hand_scores["orientation"],
+        "left_hand_openness": left_hand_scores["openness"],
+        "right_hand_openness": right_hand_scores["openness"],
+        "left_finger_spread": left_hand_scores["finger_spread"],
+        "right_finger_spread": right_hand_scores["finger_spread"],
+        "left_pinch_distance": left_hand_scores["pinch_distance"],
+        "right_pinch_distance": right_hand_scores["pinch_distance"],
         "hand_motion_energy": motion_energy,
         "gesture_score_raw": raw_score,
         "gesture_score": raw_score,
     }
 
 
+def clamp01(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def landmark_bbox(landmarks) -> tuple[float, float, float, float] | None:
+    if not landmarks:
+        return None
+    xs = [float(lm.x) for lm in landmarks.landmark]
+    ys = [float(lm.y) for lm in landmarks.landmark]
+    if not xs or not ys:
+        return None
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def compute_face_scores(face_landmarks, frame_width: int, frame_height: int) -> dict[str, float]:
+    if not face_landmarks:
+        return {"visibility": 0.0, "landmark_percent": 0.0, "size": 0.0, "yaw_score": 0.0}
+    landmark_count = len(face_landmarks.landmark)
+    landmark_percent = clamp01(landmark_count / 468.0)
+    bbox = landmark_bbox(face_landmarks)
+    if not bbox:
+        return {"visibility": 0.0, "landmark_percent": landmark_percent, "size": 0.0, "yaw_score": 0.0}
+    min_x, min_y, max_x, max_y = bbox
+    face_area_fraction = max(0.0, max_x - min_x) * max(0.0, max_y - min_y)
+    size_score = clamp01(face_area_fraction / 0.08)
+    yaw_score = estimate_face_yaw_score(face_landmarks)
+    visibility = clamp01(0.45 * landmark_percent + 0.35 * size_score + 0.20 * yaw_score)
+    return {
+        "visibility": visibility,
+        "landmark_percent": landmark_percent,
+        "size": face_area_fraction * frame_width * frame_height,
+        "yaw_score": yaw_score,
+    }
+
+
+def estimate_face_yaw_score(face_landmarks) -> float:
+    try:
+        left_eye = face_landmarks.landmark[33]
+        right_eye = face_landmarks.landmark[263]
+        nose = face_landmarks.landmark[1]
+    except IndexError:
+        return 1.0
+    eye_mid_x = (left_eye.x + right_eye.x) / 2.0
+    eye_span = abs(right_eye.x - left_eye.x)
+    if eye_span <= 0:
+        return 1.0
+    normalized_offset = abs(nose.x - eye_mid_x) / eye_span
+    return clamp01(1.0 - normalized_offset / 0.55)
+
+
+def compute_hand_scores(hand_landmarks, frame_width: int, frame_height: int) -> dict[str, float]:
+    empty = {
+        "visibility": 0.0,
+        "finger_visibility": 0.0,
+        "size": 0.0,
+        "orientation": 0.0,
+        "openness": 0.0,
+        "finger_spread": 0.0,
+        "pinch_distance": 0.0,
+    }
+    if not hand_landmarks:
+        return empty
+    landmark_count = len(hand_landmarks.landmark)
+    landmark_percent = clamp01(landmark_count / 21.0)
+    bbox = landmark_bbox(hand_landmarks)
+    if not bbox:
+        return empty
+    min_x, min_y, max_x, max_y = bbox
+    bbox_w = max(0.0, max_x - min_x) * frame_width
+    bbox_h = max(0.0, max_y - min_y) * frame_height
+    size_px = max(bbox_w, bbox_h)
+    size_score = clamp01(size_px / 90.0)
+    joint_distance_score = compute_finger_joint_distance_score(hand_landmarks, frame_width, frame_height)
+    visibility = clamp01(0.55 * landmark_percent + 0.45 * size_score)
+    finger_visibility = clamp01(0.45 * landmark_percent + 0.35 * size_score + 0.20 * joint_distance_score)
+    return {
+        "visibility": visibility,
+        "finger_visibility": finger_visibility,
+        "size": size_px,
+        "orientation": compute_hand_orientation(hand_landmarks),
+        "openness": compute_hand_openness(hand_landmarks),
+        "finger_spread": compute_finger_spread(hand_landmarks),
+        "pinch_distance": normalized_landmark_distance(hand_landmarks, 4, 8),
+    }
+
+
+def normalized_landmark_distance(landmarks, a_idx: int, b_idx: int) -> float:
+    try:
+        a = landmarks.landmark[a_idx]
+        b = landmarks.landmark[b_idx]
+    except IndexError:
+        return 0.0
+    return math.hypot(a.x - b.x, a.y - b.y)
+
+
+def compute_finger_joint_distance_score(hand_landmarks, frame_width: int, frame_height: int) -> float:
+    pairs = [
+        (5, 6),
+        (6, 7),
+        (7, 8),
+        (9, 10),
+        (10, 11),
+        (11, 12),
+        (13, 14),
+        (14, 15),
+        (15, 16),
+        (17, 18),
+        (18, 19),
+        (19, 20),
+    ]
+    distances = []
+    for a_idx, b_idx in pairs:
+        try:
+            a = hand_landmarks.landmark[a_idx]
+            b = hand_landmarks.landmark[b_idx]
+        except IndexError:
+            continue
+        distances.append(math.hypot((a.x - b.x) * frame_width, (a.y - b.y) * frame_height))
+    if not distances:
+        return 0.0
+    return clamp01(float(np.mean(distances)) / 18.0)
+
+
+def compute_hand_orientation(hand_landmarks) -> float:
+    try:
+        wrist = hand_landmarks.landmark[0]
+        middle_mcp = hand_landmarks.landmark[9]
+    except IndexError:
+        return 0.0
+    return math.atan2(middle_mcp.y - wrist.y, middle_mcp.x - wrist.x)
+
+
+def compute_hand_openness(hand_landmarks) -> float:
+    fingertips = [4, 8, 12, 16, 20]
+    try:
+        wrist = hand_landmarks.landmark[0]
+    except IndexError:
+        return 0.0
+    distances = []
+    for idx in fingertips:
+        try:
+            tip = hand_landmarks.landmark[idx]
+        except IndexError:
+            continue
+        distances.append(math.hypot(tip.x - wrist.x, tip.y - wrist.y))
+    return float(np.mean(distances)) if distances else 0.0
+
+
+def compute_finger_spread(hand_landmarks) -> float:
+    fingertip_pairs = [(4, 8), (8, 12), (12, 16), (16, 20)]
+    distances = [normalized_landmark_distance(hand_landmarks, a_idx, b_idx) for a_idx, b_idx in fingertip_pairs]
+    return float(np.mean(distances)) if distances else 0.0
+
+
+def angle_delta(a: float, b: float) -> float:
+    delta = abs(a - b)
+    return min(delta, abs((2 * math.pi) - delta))
+
+
+def compute_hand_motion_score(current: dict[str, float], previous: dict[str, float] | None, dt: float) -> float:
+    if not previous or current["visibility"] <= 0:
+        return 0.0
+    orientation_change = angle_delta(current["orientation"], previous["orientation"]) / max(dt, 0.001)
+    openness_change = abs(current["openness"] - previous["openness"]) / max(dt, 0.001)
+    spread_change = abs(current["finger_spread"] - previous["spread"]) / max(dt, 0.001)
+    pinch_change = abs(current["pinch_distance"] - previous["pinch"]) / max(dt, 0.001)
+    return clamp01(
+        min(1.0, orientation_change / 4.0) * 0.35
+        + min(1.0, openness_change / 0.8) * 0.25
+        + min(1.0, spread_change / 0.5) * 0.20
+        + min(1.0, pinch_change / 0.5) * 0.20
+    )
+
+
+def compute_arm_motion_score(
+    left_speed: float,
+    right_speed: float,
+    left_accel: float,
+    right_accel: float,
+    left_elbow_angular_velocity: float,
+    right_elbow_angular_velocity: float,
+) -> float:
+    wrist_velocity = min(1.0, (left_speed + right_speed) / 8.0)
+    wrist_acceleration = min(1.0, (left_accel + right_accel) / 60.0)
+    elbow_velocity = min(1.0, (left_elbow_angular_velocity + right_elbow_angular_velocity) / 240.0)
+    trajectory_energy = min(1.0, max(left_speed, right_speed) / 4.0)
+    return clamp01(
+        wrist_velocity * 0.35
+        + wrist_acceleration * 0.25
+        + elbow_velocity * 0.25
+        + trajectory_energy * 0.15
+    )
+
+
 def smooth_scores(rows: list[dict[str, float]], window: int) -> None:
     if not rows:
         return
-    scores = np.array([row["gesture_score_raw"] for row in rows], dtype=float)
+    smooth_columns = [
+        ("gesture_score_raw", "gesture_score"),
+        ("face_visibility_score", "face_visibility_score"),
+        ("hand_visibility_score", "hand_visibility_score"),
+        ("finger_visibility_score", "finger_visibility_score"),
+        ("arm_motion_score", "arm_motion_score"),
+        ("hand_motion_score", "hand_motion_score"),
+    ]
     kernel = np.ones(window, dtype=float) / window
-    smoothed = np.convolve(scores, kernel, mode="same")
-    for row, score in zip(rows, smoothed):
-        row["gesture_score"] = float(score)
+    for source, target in smooth_columns:
+        scores = np.array([row[source] for row in rows], dtype=float)
+        smoothed = np.convolve(scores, kernel, mode="same")
+        for row, score in zip(rows, smoothed):
+            row[target] = float(score)
 
 
 def read_frame_features(path: Path) -> list[dict[str, float]]:
     with path.open("r", encoding="utf-8", newline="") as handle:
         return [{key: float(value) for key, value in row.items()} for row in csv.DictReader(handle)]
+
+
+def frame_rows_have_scoring_columns(rows: list[dict[str, float]]) -> bool:
+    if not rows:
+        return False
+    required = {
+        "face_visibility_score",
+        "hand_visibility_score",
+        "finger_visibility_score",
+        "arm_motion_score",
+        "hand_motion_score",
+        "mean_hand_size",
+    }
+    return required.issubset(rows[0].keys())
 
 
 def write_frame_features(path: Path, rows: list[dict[str, float]]) -> None:
@@ -466,6 +804,358 @@ def gesture_threshold(rows: list[dict[str, float]], threshold: str) -> float:
     return float(threshold)
 
 
+class ReasonDetector:
+    name = "BASE"
+    requires_text = False
+    requires_finger = False
+
+    def score(self, candidate: Candidate, frames: list[dict[str, float]], text: str) -> float:
+        raise NotImplementedError
+
+    def evidence(self, candidate: Candidate, frames: list[dict[str, float]], text: str) -> dict[str, float | str]:
+        return {}
+
+    def summary(self, confidence: float, evidence: dict[str, float | str], text: str) -> str:
+        return f"{self.name}: confidence {confidence:.2f}."
+
+
+class FaceVisibleDetector(ReasonDetector):
+    name = "FACE_VISIBLE"
+
+    def score(self, candidate: Candidate, frames: list[dict[str, float]], text: str) -> float:
+        return candidate.face_visibility
+
+    def evidence(self, candidate: Candidate, frames: list[dict[str, float]], text: str) -> dict[str, float | str]:
+        return {"mean_face_visibility": candidate.face_visibility}
+
+    def summary(self, confidence: float, evidence: dict[str, float | str], text: str) -> str:
+        return f"Face visible for most of the segment; mean face score {confidence:.2f}."
+
+
+class HandsVisibleDetector(ReasonDetector):
+    name = "HANDS_VISIBLE"
+
+    def score(self, candidate: Candidate, frames: list[dict[str, float]], text: str) -> float:
+        return candidate.hand_visibility
+
+    def evidence(self, candidate: Candidate, frames: list[dict[str, float]], text: str) -> dict[str, float | str]:
+        return {
+            "mean_hand_visibility": candidate.hand_visibility,
+            "left_hand_visible_percent": candidate.left_hand_visible_percent,
+            "right_hand_visible_percent": candidate.right_hand_visible_percent,
+        }
+
+    def summary(self, confidence: float, evidence: dict[str, float | str], text: str) -> str:
+        return (
+            f"Hands visible; left {float(evidence['left_hand_visible_percent']):.0%}, "
+            f"right {float(evidence['right_hand_visible_percent']):.0%} of frames."
+        )
+
+
+class LargeArmMovementDetector(ReasonDetector):
+    name = "LARGE_ARM_MOVEMENT"
+
+    def score(self, candidate: Candidate, frames: list[dict[str, float]], text: str) -> float:
+        return clamp01(max(candidate.arm_motion, candidate.mean_gesture_score))
+
+    def evidence(self, candidate: Candidate, frames: list[dict[str, float]], text: str) -> dict[str, float | str]:
+        high_motion = frame_percent(frames, "arm_motion_score", 0.45)
+        max_speed = max((row["left_wrist_speed"] + row["right_wrist_speed"] for row in frames), default=0.0)
+        return {"high_motion_percent": high_motion, "max_combined_wrist_speed": max_speed}
+
+    def summary(self, confidence: float, evidence: dict[str, float | str], text: str) -> str:
+        return (
+            f"High wrist/elbow movement over {float(evidence['high_motion_percent']):.0%} of frames; "
+            f"max wrist speed {float(evidence['max_combined_wrist_speed']):.2f} torso-widths/s."
+        )
+
+
+class BeatGestureDetector(ReasonDetector):
+    name = "BEAT_GESTURE"
+
+    def score(self, candidate: Candidate, frames: list[dict[str, float]], text: str) -> float:
+        peaks = motion_peak_count(frames)
+        if candidate.duration <= 0:
+            return 0.0
+        peak_density = peaks / max(candidate.duration, 1.0)
+        return clamp01(min(1.0, peaks / 4.0) * 0.65 + min(1.0, peak_density / 1.2) * 0.35)
+
+    def evidence(self, candidate: Candidate, frames: list[dict[str, float]], text: str) -> dict[str, float | str]:
+        return {"motion_peaks": motion_peak_count(frames), "duration": candidate.duration}
+
+    def summary(self, confidence: float, evidence: dict[str, float | str], text: str) -> str:
+        return f"Detected {int(evidence['motion_peaks'])} motion peaks aligned with speech over {float(evidence['duration']):.1f} seconds."
+
+
+class PointingLikeDetector(ReasonDetector):
+    name = "POINTING_LIKE"
+    requires_finger = True
+
+    def score(self, candidate: Candidate, frames: list[dict[str, float]], text: str) -> float:
+        pointing_frames = 0
+        for row in frames:
+            if row["finger_visibility_score"] < 0.45:
+                continue
+            if max(row["left_pinch_distance"], row["right_pinch_distance"]) > 0.12 and row["mean_hand_size"] >= 45:
+                pointing_frames += 1
+        return clamp01(pointing_frames / max(len(frames), 1) * 1.4)
+
+    def evidence(self, candidate: Candidate, frames: list[dict[str, float]], text: str) -> dict[str, float | str]:
+        return {"pointing_like_percent": self.score(candidate, frames, text) / 1.4}
+
+    def summary(self, confidence: float, evidence: dict[str, float | str], text: str) -> str:
+        return f"Index/thumb separation and visible hand shape suggest pointing in {float(evidence['pointing_like_percent']):.0%} of frames."
+
+
+class OpenPalmDetector(ReasonDetector):
+    name = "OPEN_PALM"
+    requires_finger = True
+
+    def score(self, candidate: Candidate, frames: list[dict[str, float]], text: str) -> float:
+        open_frames = 0
+        for row in frames:
+            openness = max(row["left_hand_openness"], row["right_hand_openness"])
+            spread = max(row["left_finger_spread"], row["right_finger_spread"])
+            if row["finger_visibility_score"] >= 0.45 and openness > 0.22 and spread > 0.09:
+                open_frames += 1
+        return clamp01(open_frames / max(len(frames), 1) * 1.3)
+
+    def evidence(self, candidate: Candidate, frames: list[dict[str, float]], text: str) -> dict[str, float | str]:
+        return {"open_palm_percent": self.score(candidate, frames, text) / 1.3}
+
+    def summary(self, confidence: float, evidence: dict[str, float | str], text: str) -> str:
+        return f"Fingers appear extended/spread with visible palm in {float(evidence['open_palm_percent']):.0%} of frames."
+
+
+class FingerArticulationDetector(ReasonDetector):
+    name = "FINGER_ARTICULATION"
+    requires_finger = True
+
+    def score(self, candidate: Candidate, frames: list[dict[str, float]], text: str) -> float:
+        return clamp01(candidate.finger_visibility * 0.55 + candidate.hand_motion * 0.45)
+
+    def evidence(self, candidate: Candidate, frames: list[dict[str, float]], text: str) -> dict[str, float | str]:
+        return {"finger_visibility": candidate.finger_visibility, "hand_motion": candidate.hand_motion}
+
+    def summary(self, confidence: float, evidence: dict[str, float | str], text: str) -> str:
+        return "Finger spread and openness changed while finger landmarks remained visible."
+
+
+class TwoHandedGestureDetector(ReasonDetector):
+    name = "TWO_HANDED_GESTURE"
+
+    def score(self, candidate: Candidate, frames: list[dict[str, float]], text: str) -> float:
+        both_visible = sum(1 for row in frames if row["left_hand_visible"] > 0 and row["right_hand_visible"] > 0)
+        both_percent = both_visible / max(len(frames), 1)
+        return clamp01(both_percent * 0.65 + candidate.hand_motion * 0.35)
+
+    def evidence(self, candidate: Candidate, frames: list[dict[str, float]], text: str) -> dict[str, float | str]:
+        both_visible = sum(1 for row in frames if row["left_hand_visible"] > 0 and row["right_hand_visible"] > 0)
+        return {"both_hands_visible_percent": both_visible / max(len(frames), 1), "hand_motion": candidate.hand_motion}
+
+    def summary(self, confidence: float, evidence: dict[str, float | str], text: str) -> str:
+        return f"Both hands visible in {float(evidence['both_hands_visible_percent']):.0%} of frames with hand motion present."
+
+
+class HandNearFaceDetector(ReasonDetector):
+    name = "HAND_NEAR_FACE"
+
+    def score(self, candidate: Candidate, frames: list[dict[str, float]], text: str) -> float:
+        return hand_near_face_percent(frames)
+
+    def evidence(self, candidate: Candidate, frames: list[dict[str, float]], text: str) -> dict[str, float | str]:
+        return {"hand_near_face_percent": hand_near_face_percent(frames)}
+
+    def summary(self, confidence: float, evidence: dict[str, float | str], text: str) -> str:
+        return f"Hand approaches face/head region in {float(evidence['hand_near_face_percent']):.0%} of frames."
+
+
+class TextGestureDetector(ReasonDetector):
+    requires_text = True
+
+    def __init__(self, name: str, words: set[str]) -> None:
+        self.name = name
+        self.words = words
+
+    def score(self, candidate: Candidate, frames: list[dict[str, float]], text: str) -> float:
+        hits = matching_text_markers(text, self.words)
+        if not hits:
+            return 0.0
+        return clamp01(candidate.percent_frames_gesturing * 0.55 + candidate.mean_gesture_score * 0.35 + min(1.0, len(hits) / 2.0) * 0.10)
+
+    def evidence(self, candidate: Candidate, frames: list[dict[str, float]], text: str) -> dict[str, float | str]:
+        return {"markers": ", ".join(matching_text_markers(text, self.words)), "gesture_percent": candidate.percent_frames_gesturing}
+
+    def summary(self, confidence: float, evidence: dict[str, float | str], text: str) -> str:
+        return f"Transcript contains '{evidence['markers']}' during high gesture activity."
+
+
+TEXT_REASON_MARKERS = {
+    "en": {
+        "DEICTIC_TEXT_WITH_GESTURE": {
+            "this",
+            "that",
+            "here",
+            "there",
+            "these",
+            "those",
+            "look",
+            "see",
+        },
+        "EMPHASIS_TEXT_WITH_GESTURE": {
+            "really",
+            "very",
+            "important",
+            "exactly",
+            "never",
+            "always",
+            "must",
+            "key",
+        },
+        "CONTRAST_TEXT_WITH_GESTURE": {
+            "but",
+            "however",
+            "on the other hand",
+            "whereas",
+            "instead",
+        },
+    },
+    "sv": {
+        "DEICTIC_TEXT_WITH_GESTURE": {
+            "den här",
+            "det här",
+            "den där",
+            "det där",
+            "dessa",
+            "de här",
+            "de där",
+            "här",
+            "där",
+            "detta",
+            "denna",
+            "titta",
+            "kolla",
+            "se",
+            "ser",
+        },
+        "EMPHASIS_TEXT_WITH_GESTURE": {
+            "verkligen",
+            "väldigt",
+            "viktigt",
+            "exakt",
+            "aldrig",
+            "alltid",
+            "måste",
+            "nyckel",
+            "helt",
+            "riktigt",
+            "jätte",
+        },
+        "CONTRAST_TEXT_WITH_GESTURE": {
+            "men",
+            "dock",
+            "däremot",
+            "å andra sidan",
+            "medan",
+            "istället",
+            "i stället",
+        },
+    },
+}
+
+
+def text_reason_markers_for_language(language: str) -> dict[str, set[str]]:
+    normalized = language.lower().split("-")[0]
+    if normalized in TEXT_REASON_MARKERS:
+        return TEXT_REASON_MARKERS[normalized]
+    return TEXT_REASON_MARKERS["en"]
+
+
+def build_reason_detectors(config: ReasonConfig) -> list[ReasonDetector]:
+    text_markers = text_reason_markers_for_language(config.language)
+    detectors: list[ReasonDetector] = [
+        FaceVisibleDetector(),
+        HandsVisibleDetector(),
+        LargeArmMovementDetector(),
+        BeatGestureDetector(),
+        PointingLikeDetector(),
+        OpenPalmDetector(),
+        FingerArticulationDetector(),
+        TwoHandedGestureDetector(),
+        HandNearFaceDetector(),
+        TextGestureDetector("DEICTIC_TEXT_WITH_GESTURE", text_markers["DEICTIC_TEXT_WITH_GESTURE"]),
+        TextGestureDetector("EMPHASIS_TEXT_WITH_GESTURE", text_markers["EMPHASIS_TEXT_WITH_GESTURE"]),
+        TextGestureDetector("CONTRAST_TEXT_WITH_GESTURE", text_markers["CONTRAST_TEXT_WITH_GESTURE"]),
+    ]
+    filtered = []
+    for detector in detectors:
+        if config.labels is not None and detector.name not in config.labels:
+            continue
+        if detector.requires_text and not config.enable_text_reasons:
+            continue
+        if detector.requires_finger and not config.enable_finger_reasons:
+            continue
+        filtered.append(detector)
+    return filtered
+
+
+def apply_reason_labels(candidate: Candidate, frames: list[dict[str, float]], config: ReasonConfig) -> None:
+    scored: list[tuple[str, float, dict[str, float | str], str]] = []
+    for detector in build_reason_detectors(config):
+        confidence = clamp01(detector.score(candidate, frames, candidate.text))
+        evidence = detector.evidence(candidate, frames, candidate.text)
+        if confidence >= config.threshold:
+            scored.append((detector.name, confidence, evidence, detector.summary(confidence, evidence, candidate.text)))
+    scored.sort(key=lambda item: item[1], reverse=True)
+    selected = scored[: max(1, config.top_reasons)]
+    candidate.reason_labels = [name for name, _, _, _ in selected]
+    candidate.primary_reason = selected[0][0] if selected else ""
+    candidate.reason_confidences = {name: round(confidence, 6) for name, confidence, _, _ in selected}
+    candidate.reason_evidence = {name: evidence for name, _, evidence, _ in selected}
+    candidate.evidence_summary = " ".join(summary for _, _, _, summary in selected[:3])
+
+
+def frame_percent(frames: list[dict[str, float]], key: str, threshold: float) -> float:
+    return sum(1 for row in frames if row[key] >= threshold) / max(len(frames), 1)
+
+
+def motion_peak_count(frames: list[dict[str, float]]) -> int:
+    if len(frames) < 3:
+        return 0
+    values = [row["arm_motion_score"] for row in frames]
+    peaks = 0
+    for idx in range(1, len(values) - 1):
+        if values[idx] > 0.25 and values[idx] >= values[idx - 1] and values[idx] > values[idx + 1]:
+            peaks += 1
+    return peaks
+
+
+def hand_near_face_percent(frames: list[dict[str, float]]) -> float:
+    near = 0
+    eligible = 0
+    for row in frames:
+        face_visible = row["face_visibility_score"] > 0.4
+        if not face_visible:
+            continue
+        face_x = (row["left_shoulder_x"] + row["right_shoulder_x"]) / 2.0
+        face_y = min(row["left_shoulder_y"], row["right_shoulder_y"]) - 0.18
+        for side in ("left", "right"):
+            if row[f"{side}_hand_visible"] <= 0:
+                continue
+            eligible += 1
+            dist = math.hypot(row[f"{side}_wrist_x"] - face_x, row[f"{side}_wrist_y"] - face_y)
+            if dist < 0.28:
+                near += 1
+    return near / max(eligible, 1)
+
+
+def matching_text_markers(text: str, markers: set[str]) -> list[str]:
+    normalized = re.sub(r"[^\w\s]", " ", text.lower(), flags=re.UNICODE)
+    compact = re.sub(r"\s+", " ", normalized)
+    padded = f" {compact} "
+    return sorted(marker for marker in markers if f" {marker} " in padded)
+
+
 def build_candidates(
     text_segments: list[TextSegment],
     frame_rows: list[dict[str, float]],
@@ -474,6 +1164,9 @@ def build_candidates(
     max_duration: float,
     threshold_arg: str,
     top_k: int,
+    weights: RankingWeights,
+    filters: CandidateFilters,
+    reason_config: ReasonConfig,
 ) -> list[Candidate]:
     if not text_segments or not frame_rows:
         return []
@@ -486,44 +1179,69 @@ def build_candidates(
         overlapping = [row for row in frame_rows if segment.start <= row["timestamp"] <= segment.end]
         if not overlapping:
             continue
+        if not segment.text.strip():
+            continue
         scores = np.array([row["gesture_score"] for row in overlapping], dtype=float)
         gesturing = scores >= threshold
         left_visible = np.array([row["left_hand_visible"] for row in overlapping], dtype=float)
         right_visible = np.array([row["right_hand_visible"] for row in overlapping], dtype=float)
         pose_visible = np.array([row["pose_visible"] for row in overlapping], dtype=float)
+        face_visibility = float(np.mean([row["face_visibility_score"] for row in overlapping]))
+        hand_visibility = float(np.mean([row["hand_visibility_score"] for row in overlapping]))
+        finger_visibility = float(np.mean([row["finger_visibility_score"] for row in overlapping]))
+        arm_motion = float(np.mean([row["arm_motion_score"] for row in overlapping]))
+        hand_motion = float(np.mean([row["hand_motion_score"] for row in overlapping]))
+        mean_hand_size = float(np.mean([row["mean_hand_size"] for row in overlapping]))
         visible_percent = float(max(left_visible.mean(), right_visible.mean(), pose_visible.mean() * 0.5))
         percent_gesturing = float(gesturing.mean())
         if visible_percent <= 0 or percent_gesturing <= 0:
             continue
+        if face_visibility < filters.min_face_visible:
+            continue
+        if hand_visibility <= filters.min_hand_visible:
+            continue
+        if mean_hand_size < filters.min_hand_size:
+            continue
+        if finger_visibility < filters.min_finger_score:
+            continue
         token_count = max(1, len(segment.text.split()))
-        text_density = min(1.0, token_count / max(duration, 0.1) / 4.0)
-        duration_factor = min(1.0, duration / max_duration)
         mean_score = float(scores.mean())
         max_score = float(scores.max())
+        gesture_component = float(np.mean([mean_score, max_score, percent_gesturing]))
+        total_weight = max(
+            0.001,
+            weights.gesture + weights.face + weights.hand + weights.arm + weights.finger,
+        )
         candidate_score = (
-            max_score * 0.35
-            + mean_score * 0.25
-            + percent_gesturing * 0.2
-            + visible_percent * 0.1
-            + text_density * 0.05
-            + duration_factor * 0.05
+            gesture_component * weights.gesture
+            + face_visibility * weights.face
+            + hand_visibility * weights.hand
+            + arm_motion * weights.arm
+            + finger_visibility * weights.finger
+        ) / total_weight
+        candidate = Candidate(
+            rank=0,
+            video_id=video_id,
+            start=segment.start,
+            end=segment.end,
+            duration=duration,
+            text=segment.text,
+            candidate_score=candidate_score,
+            mean_gesture_score=mean_score,
+            max_gesture_score=max_score,
+            percent_frames_gesturing=percent_gesturing,
+            left_hand_visible_percent=float(left_visible.mean()),
+            right_hand_visible_percent=float(right_visible.mean()),
+            face_visibility=face_visibility,
+            hand_visibility=hand_visibility,
+            finger_visibility=finger_visibility,
+            arm_motion=arm_motion,
+            hand_motion=hand_motion,
+            speech_duration=duration,
+            mean_hand_size=mean_hand_size,
         )
-        candidates.append(
-            Candidate(
-                rank=0,
-                video_id=video_id,
-                start=segment.start,
-                end=segment.end,
-                duration=duration,
-                text=segment.text,
-                candidate_score=candidate_score,
-                mean_gesture_score=mean_score,
-                max_gesture_score=max_score,
-                percent_frames_gesturing=percent_gesturing,
-                left_hand_visible_percent=float(left_visible.mean()),
-                right_hand_visible_percent=float(right_visible.mean()),
-            )
-        )
+        apply_reason_labels(candidate, overlapping, reason_config)
+        candidates.append(candidate)
     candidates.sort(key=lambda item: item.candidate_score, reverse=True)
     for index, candidate in enumerate(candidates[:top_k], start=1):
         candidate.rank = index
@@ -562,6 +1280,20 @@ def candidate_as_dict(candidate: Candidate) -> dict[str, str | int | float]:
         "percent_frames_gesturing": round(candidate.percent_frames_gesturing, 6),
         "left_hand_visible_percent": round(candidate.left_hand_visible_percent, 6),
         "right_hand_visible_percent": round(candidate.right_hand_visible_percent, 6),
+        "face_visibility": round(candidate.face_visibility, 6),
+        "hand_visibility": round(candidate.hand_visibility, 6),
+        "finger_visibility": round(candidate.finger_visibility, 6),
+        "arm_motion": round(candidate.arm_motion, 6),
+        "hand_motion": round(candidate.hand_motion, 6),
+        "speech_duration": round(candidate.speech_duration, 3),
+        "mean_hand_size": round(candidate.mean_hand_size, 3),
+        "primary_reason": candidate.primary_reason,
+        "reason_labels": "|".join(candidate.reason_labels),
+        "reason_labels_list": candidate.reason_labels,
+        "reason_confidences": candidate.reason_confidences,
+        "reason_confidences_json": json.dumps(candidate.reason_confidences, sort_keys=True),
+        "reason_evidence": candidate.reason_evidence,
+        "evidence_summary": candidate.evidence_summary,
         "clip_path": candidate.clip_path,
     }
 
@@ -581,12 +1313,23 @@ def write_candidates(out_dir: Path, candidates: list[Candidate]) -> None:
         "percent_frames_gesturing",
         "left_hand_visible_percent",
         "right_hand_visible_percent",
+        "face_visibility",
+        "hand_visibility",
+        "finger_visibility",
+        "arm_motion",
+        "hand_motion",
+        "speech_duration",
+        "mean_hand_size",
+        "primary_reason",
+        "reason_labels",
+        "reason_confidences_json",
+        "evidence_summary",
         "clip_path",
     ]
     with (out_dir / "candidates.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows([{key: row.get(key, "") for key in fieldnames} for row in rows])
     (out_dir / "candidates.json").write_text(json.dumps(rows, indent=2), encoding="utf-8")
 
 
@@ -797,19 +1540,41 @@ def write_html_report(
     timeline_chart: bool = False,
 ) -> None:
     rows = []
+    reason_options = sorted({label for candidate in candidates for label in candidate.reason_labels})
     for candidate in candidates:
         media = ""
         if candidate.clip_path:
             media = f'<video src="{html.escape(candidate.clip_path)}" controls width="360"></video>'
+        badges = " ".join(f'<span class="badge">{html.escape(label)}</span>' for label in candidate.reason_labels)
+        primary_confidence = candidate.reason_confidences.get(candidate.primary_reason, 0.0)
+        reason_cell = (
+            f'<strong>{html.escape(candidate.primary_reason or "NONE")}</strong> '
+            f'<span class="reason-confidence">{primary_confidence:.3f}</span>'
+            f'<div class="badges">{badges}</div>'
+        )
+        transcript_cell = (
+            f"{html.escape(candidate.text)}"
+            f'<div class="evidence-summary">{html.escape(candidate.evidence_summary)}</div>'
+        )
         rows.append(
-            f'<tr id="candidate-{candidate.rank}">'
+            f'<tr id="candidate-{candidate.rank}" data-reasons="{html.escape("|".join(candidate.reason_labels))}">'
             f"<td>{candidate.rank}</td>"
             f"<td>{candidate.start:.2f}-{candidate.end:.2f}</td>"
             f"<td>{candidate.candidate_score:.3f}</td>"
-            f"<td>{html.escape(candidate.text)}</td>"
+            f"<td>{reason_cell}</td>"
+            f"<td>{primary_confidence:.3f}</td>"
+            f"<td>{candidate.face_visibility:.3f}</td>"
+            f"<td>{candidate.hand_visibility:.3f}</td>"
+            f"<td>{candidate.finger_visibility:.3f}</td>"
+            f"<td>{candidate.arm_motion:.3f}</td>"
+            f"<td>{candidate.hand_motion:.3f}</td>"
+            f"<td>{transcript_cell}</td>"
             f"<td>{media}</td>"
             "</tr>"
         )
+    reason_filter_options = "".join(
+        f'<option value="{html.escape(label)}">{html.escape(label)}</option>' for label in reason_options
+    )
     document = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -848,20 +1613,57 @@ def write_html_report(
       white-space: nowrap;
     }}
     .timeline-axis {{ display: flex; justify-content: space-between; color: #666; font-size: 12px; margin-top: 6px; }}
+    .controls {{ margin: 16px 0; }}
+    .badge {{ display: inline-block; margin: 4px 4px 0 0; padding: 2px 6px; border-radius: 4px; background: #e8f0f7; color: #134d78; font-size: 12px; }}
+    .reason-confidence {{ color: #666; font-size: 12px; margin-left: 4px; }}
+    .evidence-summary {{ color: #555; font-size: 13px; margin-top: 6px; max-width: 680px; }}
     table {{ border-collapse: collapse; width: 100%; }}
     th, td {{ border-bottom: 1px solid #ddd; padding: 8px; vertical-align: top; }}
-    th {{ text-align: left; }}
+    th {{ text-align: left; cursor: pointer; user-select: none; }}
+    th.no-sort {{ cursor: default; }}
   </style>
 </head>
 <body>
   <h1>Gesture/Text Candidates</h1>
   {build_timeline_chart(candidates, video_duration) if timeline_chart else ""}
-  <table>
-    <thead><tr><th>Rank</th><th>Time</th><th>Score</th><th>Text</th><th>Clip</th></tr></thead>
+  <div class="controls">
+    <label for="reason-filter">Reason</label>
+    <select id="reason-filter">
+      <option value="">All reasons</option>
+      {reason_filter_options}
+    </select>
+  </div>
+  <table id="candidates-table">
+    <thead><tr><th>Rank</th><th>Time</th><th>Score</th><th class="no-sort">Reason</th><th>Reason Conf.</th><th>Face</th><th>Hand</th><th>Finger</th><th>Arm</th><th>Hand Motion</th><th class="no-sort">Text</th><th class="no-sort">Clip</th></tr></thead>
     <tbody>
       {''.join(rows)}
     </tbody>
   </table>
+  <script>
+    document.querySelectorAll('#candidates-table th:not(.no-sort)').forEach((th, index) => {{
+      th.addEventListener('click', () => {{
+        const table = th.closest('table');
+        const tbody = table.querySelector('tbody');
+        const rows = Array.from(tbody.querySelectorAll('tr'));
+        const direction = th.dataset.sort === 'desc' ? 1 : -1;
+        rows.sort((a, b) => {{
+          const av = parseFloat(a.children[index].textContent) || 0;
+          const bv = parseFloat(b.children[index].textContent) || 0;
+          return (av - bv) * direction;
+        }});
+        table.querySelectorAll('th').forEach(header => delete header.dataset.sort);
+        th.dataset.sort = direction === 1 ? 'asc' : 'desc';
+        rows.forEach(row => tbody.appendChild(row));
+      }});
+    }});
+    document.querySelector('#reason-filter').addEventListener('change', (event) => {{
+      const selected = event.target.value;
+      document.querySelectorAll('#candidates-table tbody tr').forEach((row) => {{
+        const labels = row.dataset.reasons ? row.dataset.reasons.split('|') : [];
+        row.style.display = !selected || labels.includes(selected) ? '' : 'none';
+      }});
+    }});
+  </script>
 </body>
 </html>
 """
@@ -906,6 +1708,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pre-roll", type=float, default=0.5)
     parser.add_argument("--post-roll", type=float, default=0.75)
     parser.add_argument("--gesture-threshold", default="auto")
+    parser.add_argument("--min-face-visible", type=float, default=0.80)
+    parser.add_argument("--min-hand-visible", type=float, default=0.0)
+    parser.add_argument("--min-hand-size", type=float, default=0.0)
+    parser.add_argument("--min-finger-score", type=float, default=0.0)
+    parser.add_argument("--gesture-weight", type=float, default=0.30)
+    parser.add_argument("--face-weight", type=float, default=0.25)
+    parser.add_argument("--hand-weight", type=float, default=0.20)
+    parser.add_argument("--arm-weight", type=float, default=0.15)
+    parser.add_argument("--finger-weight", type=float, default=0.10)
+    parser.add_argument("--reason-threshold", type=float, default=0.60)
+    parser.add_argument("--enable-text-reasons", type=parse_bool, default=True)
+    parser.add_argument("--enable-finger-reasons", type=parse_bool, default=True)
+    parser.add_argument("--reason-labels", default="all", help="Comma-separated reason labels to run, or 'all'.")
+    parser.add_argument("--top-reasons", type=int, default=5)
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--make-clips", type=parse_bool, default=False)
     parser.add_argument(
@@ -965,6 +1781,27 @@ def main(argv: Iterable[str] | None = None) -> int:
         args.max_duration,
         args.gesture_threshold,
         args.top_k,
+        RankingWeights(
+            gesture=args.gesture_weight,
+            face=args.face_weight,
+            hand=args.hand_weight,
+            arm=args.arm_weight,
+            finger=args.finger_weight,
+        ),
+        CandidateFilters(
+            min_face_visible=args.min_face_visible,
+            min_hand_visible=args.min_hand_visible,
+            min_hand_size=args.min_hand_size,
+            min_finger_score=args.min_finger_score,
+        ),
+        ReasonConfig(
+            threshold=args.reason_threshold,
+            enable_text_reasons=args.enable_text_reasons,
+            enable_finger_reasons=args.enable_finger_reasons,
+            labels=parse_reason_labels(args.reason_labels),
+            top_reasons=args.top_reasons,
+            language=args.lang,
+        ),
     )
     if args.make_clips and candidates:
         make_clips(

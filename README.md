@@ -43,6 +43,36 @@ bin/python gesture_text_candidates.py \
 
 This mode avoids YouTube and is useful for quick local checks.
 
+## Presets
+
+`gesture_preset.py` wraps the main CLI with coarse candidate-volume presets:
+
+- `high`: permissive, likely many candidates.
+- `mid`: balanced, likely a medium review set.
+- `low`: strict, likely fewer cleaner candidates.
+
+Example:
+
+```bash
+bin/python gesture_preset.py high \
+  --video classic-carbonara.mp4 \
+  --subtitles classic-carbonara.vtt \
+  --lang en \
+  --out ./run_carbonara_high
+```
+
+The wrapper defaults to `--sample-fps 2`, `--make-clips true`, and `--timeline-chart true`.
+
+You can override preset values after `--`:
+
+```bash
+bin/python gesture_preset.py mid \
+  --video classic-carbonara.mp4 \
+  --subtitles classic-carbonara.vtt \
+  --lang en \
+  -- --top-k 20 --min-face-visible 0.3
+```
+
 ## Outputs
 
 The output directory contains:
@@ -62,9 +92,9 @@ When `--timeline-chart true` is used, `index.html` includes a whole-video timeli
 
 ## Scoring
 
-The tool first samples video frames, detects pose/hand landmarks with MediaPipe, and writes per-frame features to `frame_features.csv`.
+The tool first samples video frames, detects face/pose/hand landmarks with MediaPipe, and writes per-frame features to `frame_features.csv`.
 
-Frame-level `gesture_score` is based on:
+The original frame-level `gesture_score` is preserved. It is based on:
 
 - normalized wrist speed
 - normalized wrist acceleration
@@ -72,36 +102,111 @@ Frame-level `gesture_score` is based on:
 - whether hands are above shoulders
 - whether hands are extended far from the torso
 
+The newer ranking model adds independent frame scores:
+
+- `face_visibility_score`: face landmarks, estimated face size, and a rough frontal/three-quarter yaw score.
+- `hand_visibility_score`: detected hand landmarks and estimated hand size.
+- `finger_visibility_score`: hand size plus whether finger joint spacing is large enough to inspect articulation.
+- `arm_motion_score`: wrist velocity, wrist acceleration, elbow angular velocity, and trajectory energy.
+- `hand_motion_score`: palm orientation change, hand openness change, finger spread change, and pinch/open-close change.
+
+MediaPipe Holistic's `solutions` API does not expose reliable per-landmark confidence for every face/hand point, so tracking confidence is approximated from landmark presence, size, and stability-derived motion signals.
+
 Scores are smoothed over roughly `0.7s` so a single noisy frame has less influence.
 
-For each subtitle window, the tool computes overlapping gesture statistics:
+For each subtitle window, the tool computes overlapping segment statistics:
 
 - `mean_gesture_score`
 - `max_gesture_score`
 - `percent_frames_gesturing`
 - `left_hand_visible_percent`
 - `right_hand_visible_percent`
+- `face_visibility`
+- `hand_visibility`
+- `finger_visibility`
+- `arm_motion`
+- `hand_motion`
+- `speech_duration`
+- `mean_hand_size`
 
 Candidate score is currently:
 
 ```python
+gesture_component = mean([mean_gesture_score, max_gesture_score, percent_frames_gesturing])
+
 candidate_score = (
-    max_gesture_score * 0.35
-    + mean_gesture_score * 0.25
-    + percent_frames_gesturing * 0.20
-    + visible_percent * 0.10
-    + text_density * 0.05
-    + duration_factor * 0.05
-)
+    gesture_component * gesture_weight
+    + face_visibility * face_weight
+    + hand_visibility * hand_weight
+    + arm_motion * arm_weight
+    + finger_visibility * finger_weight
+) / total_weight
 ```
 
-`visible_percent` is the strongest of left-hand visibility, right-hand visibility, or partial pose visibility for the segment.
+Default weights:
 
-`text_density` is a capped speech-rate proxy based on words per second.
+- `--gesture-weight 0.30`
+- `--face-weight 0.25`
+- `--hand-weight 0.20`
+- `--arm-weight 0.15`
+- `--finger-weight 0.10`
 
-`duration_factor` mildly favors longer windows up to `--max-duration`.
+Candidate filters:
+
+- `--min-face-visible 0.80`
+- `--min-hand-visible 0.0`
+- `--min-hand-size 0.0`
+- `--min-finger-score 0.0`
+
+The default face filter is intentionally strict: it prioritizes clips where the active speaker's face is clearly visible. Lower `--min-face-visible` when working with cooking overhead shots, instrument closeups, or other videos where hands matter more than face.
 
 `--gesture-threshold` controls which frames count as gesturing for `percent_frames_gesturing`. It does not directly set a minimum `candidate_score`, and it does not override duration filters. `--gesture-threshold auto` uses the 80th percentile of nonzero smoothed gesture scores. A numeric value such as `0.01` makes the gesturing-frame test more permissive.
+
+### Reason Labels
+
+After numeric scoring, the tool runs a transparent heuristic reason-label layer. This does not replace the numeric scores; it explains why a candidate may be interesting.
+
+Each candidate can include:
+
+- `primary_reason`
+- `reason_labels`
+- `reason_confidences_json`
+- `evidence_summary`
+- structured `reason_confidences` and `reason_evidence` in `candidates.json`
+
+Implemented labels:
+
+- `FACE_VISIBLE`
+- `HANDS_VISIBLE`
+- `LARGE_ARM_MOVEMENT`
+- `BEAT_GESTURE`
+- `POINTING_LIKE`
+- `OPEN_PALM`
+- `FINGER_ARTICULATION`
+- `TWO_HANDED_GESTURE`
+- `HAND_NEAR_FACE`
+- `DEICTIC_TEXT_WITH_GESTURE`
+- `EMPHASIS_TEXT_WITH_GESTURE`
+- `CONTRAST_TEXT_WITH_GESTURE`
+
+Reason labels are controlled by:
+
+- `--reason-threshold 0.6`
+- `--enable-text-reasons true`
+- `--enable-finger-reasons true`
+- `--reason-labels all`
+- `--top-reasons 5`
+
+Text-based reason labels use `--lang`. English (`en`) and Swedish (`sv`) marker sets are currently supported. Visual reason labels are language-independent.
+
+Examples:
+
+```bash
+--lang en
+--lang sv
+```
+
+`index.html` shows reason badges, the primary reason, evidence summaries, a reason-label filter, and a sortable reason-confidence column.
 
 By default, adjacent subtitle cues are merged when the gap is `<= --merge-gap`, default `0.75s`. For Whisper VTT/SRT files that already have good review-sized segments, use:
 
@@ -125,6 +230,20 @@ This preserves the original VTT/SRT cue segmentation.
 --pre-roll 0.5
 --post-roll 0.75
 --gesture-threshold auto
+--min-face-visible 0.80
+--min-hand-visible 0.0
+--min-hand-size 0.0
+--min-finger-score 0.0
+--gesture-weight 0.30
+--face-weight 0.25
+--hand-weight 0.20
+--arm-weight 0.15
+--finger-weight 0.10
+--reason-threshold 0.6
+--enable-text-reasons true
+--enable-finger-reasons true
+--reason-labels all
+--top-reasons 5
 --top-k 50
 --make-clips false
 --overlay-stickman false
